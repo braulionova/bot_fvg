@@ -1,8 +1,8 @@
-use crate::config::SymbolParams;
+use crate::config::{SymbolParams, MAX_RISK_PER_TRADE_PCT};
 use crate::types::{FVGType, PositionData, RiskMetrics, TradeSignal};
 
-pub fn calculate_position_size(signal: &TradeSignal, metrics: &RiskMetrics) -> f64 {
-    let max_risk = metrics.account_balance * 0.03;
+pub fn calculate_position_size(signal: &TradeSignal, metrics: &RiskMetrics, p: &SymbolParams) -> f64 {
+    let max_risk = metrics.account_balance * MAX_RISK_PER_TRADE_PCT;
 
     // Don't exceed remaining daily drawdown budget
     let remaining_daily_budget = (metrics.max_daily_loss - metrics.daily_pnl.abs()).max(0.0);
@@ -11,7 +11,10 @@ pub fn calculate_position_size(signal: &TradeSignal, metrics: &RiskMetrics) -> f
     let risk_per_unit = (signal.entry_price - signal.stop_loss).abs();
 
     if risk_per_unit > 0.0 {
-        (actual_max_risk / risk_per_unit).floor()
+        let raw_qty = actual_max_risk / risk_per_unit;
+        // Round DOWN to the exchange's minimum lot step (e.g. 0.001 BTC, 0.01 ETH, 1 XRP)
+        let steps = (raw_qty / p.qty_step).floor();
+        steps * p.qty_step
     } else {
         0.0
     }

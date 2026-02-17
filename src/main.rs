@@ -271,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     position_manager::set_stop_loss(&mut sig, atr, &p);
                     position_manager::calculate_take_profits(&mut sig, &p);
                     sig.position_size =
-                        position_manager::calculate_position_size(&sig, &metrics);
+                        position_manager::calculate_position_size(&sig, &metrics, &p);
                     Some((sig, "Buy"))
                 } else {
                     None
@@ -282,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     position_manager::set_stop_loss(&mut sig, atr, &p);
                     position_manager::calculate_take_profits(&mut sig, &p);
                     sig.position_size =
-                        position_manager::calculate_position_size(&sig, &metrics);
+                        position_manager::calculate_position_size(&sig, &metrics, &p);
                     Some((sig, "Sell"))
                 } else {
                     None
@@ -292,6 +292,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let has_entry = entry_signal.is_some();
+
+            // Log FVG detection state every cycle for diagnostics
+            match (fvg_direction, has_entry) {
+                (dir, true) => log::info!(
+                    "[{}] {} FVG → breakout confirmado | precio={:.2} ATR={:.2}",
+                    symbol, dir, current_price, atr
+                ),
+                ("bullish" | "bearish", false) => log::info!(
+                    "[{}] {} FVG detectado, sin breakout aún | precio={:.2} ATR={:.2}",
+                    symbol, fvg_direction, current_price, atr
+                ),
+                _ => log::info!(
+                    "[{}] Sin FVG en ventana ({}v) | precio={:.2} ATR={:.2}",
+                    symbol, p.fvg_lookback, current_price, atr
+                ),
+            }
 
             if let Some((sig, side)) = entry_signal {
                 match position_manager::validate_trade(&sig, &metrics) {

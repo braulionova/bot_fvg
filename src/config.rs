@@ -32,22 +32,23 @@ pub struct SymbolParams {
     pub sl_atr_mult:   f64,   // multiplicador ATR para el stop-loss
     pub tp_mult:       f64,   // ratio riesgo:recompensa
     pub time_stop:     usize, // velas máximas en posición
+    pub qty_step:      f64,   // paso mínimo de cantidad (Bybit lotSize)
 }
 
 pub const fn params(
     min_gap_pct: f64, min_vol_mult: f64, fvg_lookback: usize,
-    sl_atr_mult: f64, tp_mult: f64, time_stop: usize,
+    sl_atr_mult: f64, tp_mult: f64, time_stop: usize, qty_step: f64,
 ) -> SymbolParams {
-    SymbolParams { min_gap_pct, min_vol_mult, fvg_lookback, sl_atr_mult, tp_mult, time_stop }
+    SymbolParams { min_gap_pct, min_vol_mult, fvg_lookback, sl_atr_mult, tp_mult, time_stop, qty_step }
 }
 
 pub fn symbol_params(symbol: &str) -> SymbolParams {
     match symbol {
-        "BTCUSDT" => params(0.001, 1.5, 12, 0.5, 5.0,  7),
-        "ETHUSDT" => params(0.001, 1.5,  8, 1.0, 3.0,  7),
-        "BNBUSDT" => params(0.003, 1.0, 12, 2.0, 2.5, 35),
-        "XRPUSDT" => params(0.008, 1.0,  8, 2.0, 1.5, 14),
-        "SOLUSDT" => params(0.008, 1.2, 12, 1.5, 4.0,  7),
-        _         => params(0.003, 1.2,  8, 1.0, 2.0,  7), // fallback
+        "BTCUSDT" => params(0.001, 1.5, 12, 0.5, 5.0,  7, 0.001),
+        "ETHUSDT" => params(0.001, 1.5,  8, 1.0, 3.0,  7, 0.01),
+        "BNBUSDT" => params(0.003, 1.0, 12, 2.0, 2.5, 35, 0.01),
+        "XRPUSDT" => params(0.008, 1.0,  8, 2.0, 1.5, 14, 1.0),
+        "SOLUSDT" => params(0.008, 1.2, 12, 1.5, 4.0,  7, 0.1),
+        _         => params(0.003, 1.2,  8, 1.0, 2.0,  7, 1.0), // fallback
     }
 }
