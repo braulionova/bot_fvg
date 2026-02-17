@@ -1,0 +1,17 @@
+# Credentials — NEVER commit the real .env
+.env
+
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Data files (historical candles, backtest results)
+/data/*.csv
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs / temp
+*.log

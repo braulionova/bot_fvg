@@ -1,0 +1,5 @@
+[build]
+rustflags = [
+    "-C", "target-cpu=native",   # instrucciones SIMD/AVX del CPU actual
+    "-C", "force-frame-pointers=no",  # elimina frame pointers (menos overhead)
+]

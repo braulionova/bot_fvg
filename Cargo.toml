@@ -1,0 +1,37 @@
+[package]
+name = "fvg_trader"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11"
+log = "0.4"
+reqwest = { version = "0.11", features = ["json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+futures-util = "0.3"
+
+[[bin]]
+name = "fvg_trader"
+path = "src/main.rs"
+
+[profile.release]
+opt-level      = 3          # máxima optimización
+lto            = "fat"      # Link-Time Optimization entre todos los crates
+codegen-units  = 1          # una sola unidad: mejor inlining cross-crate
+panic          = "abort"    # elimina overhead de unwinding
+strip          = "debuginfo" # quita debug info, mantiene símbolos
+
+[dependencies.tikv-jemallocator]
+version  = "0.6"
+optional = true
+
+[features]
+jemalloc = ["tikv-jemallocator"]
+private-ws = []  # Enable Bybit private WS (order/execution/position streams) — live only, not demo
