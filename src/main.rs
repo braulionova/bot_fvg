@@ -17,10 +17,11 @@ mod websocket_private;
 use chrono::Timelike;
 use config::{
     symbol_params, ACCOUNT_BALANCE, EQUITY_FLOOR_PCT, KLINE_INTERVAL, MAX_DAILY_LOSS_PCT,
-    MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS,
+    MAX_OPEN_POSITIONS, MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use bybit_api::ExchangePositionInfo;
 use types::{PositionData, RiskMetrics, SignalType, TradeSignal};
 
 struct OpenPosition {
@@ -244,6 +245,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            if positions.len() >= MAX_OPEN_POSITIONS {
+                status_lines.push(format!(
+                    "⏸ <b>{symbol}</b> | <code>{:.2}</code> | máx posiciones ({}/{})",
+                    current_price, positions.len(), MAX_OPEN_POSITIONS
+                ));
+                continue;
+            }
+
             let bullish = fvg_detector::detect_bullish_fvg(candles, &p);
             let bearish = fvg_detector::detect_bearish_fvg(candles, &p);
             let last_candle = candles.last().unwrap();
@@ -324,8 +333,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── Execute all pending entry orders in parallel ───────────────────────
         if !pending_orders.is_empty() {
+            // Verify live exchange position count before placing any order.
+            // This guards against state drift (e.g. manual trades, restart races).
+            let exchange_open = bybit
+                .count_open_exchange_positions(TRADING_PAIRS)
+                .await;
+            if exchange_open >= MAX_OPEN_POSITIONS {
+                log::warn!(
+                    "Exchange already has {} open positions (max {}). Skipping {} pending order(s).",
+                    exchange_open, MAX_OPEN_POSITIONS, pending_orders.len()
+                );
+                pending_orders.clear();
+            }
+
+            // Respect the global position cap even if multiple signals fired this cycle
+            let slots_available = MAX_OPEN_POSITIONS.saturating_sub(positions.len());
             let order_handles: Vec<_> = pending_orders
                 .into_iter()
+                .take(slots_available)
                 .map(|(symbol, sig, side)| {
                     let bybit = bybit.clone();
                     let tg = tg.clone();
@@ -443,9 +468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Reconcile local position state with exchange after restart.
-/// Detects orphan exchange positions (no local state) and stale local state
-/// (local position but exchange reports zero size). Only logs — no auto-correct
-/// during runtime to avoid race conditions.
+/// - Orphan (exchange open, no local state) → imports into local state so the bot
+///   can manage SL/TP/time-stop and respect the position cap.
+/// - Stale (local state, exchange size=0) → clears local state.
+/// - Size mismatch → updates local qty to match exchange.
 async fn reconcile_positions(
     bybit: &bybit_api::BybitClient,
     local_positions: &mut HashMap<String, OpenPosition>,
@@ -453,45 +479,39 @@ async fn reconcile_positions(
 ) {
     log::info!("Reconciling positions with exchange…");
     for &symbol in symbols {
-        match bybit.get_position(symbol).await {
+        match bybit.get_position_info(symbol).await {
             Err(e) => {
                 log::warn!("[{}] Reconcile fetch failed: {}", symbol, e);
                 continue;
             }
-            Ok(json) => {
-                // Parse size and side from Bybit V5 position list
-                let exchange_size: f64 = json["result"]["list"]
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|p| p["size"].as_str())
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
-
-                match (local_positions.get_mut(symbol), exchange_size > 0.0) {
-                    (None, false) => {
+            Ok(exchange_info) => {
+                match (local_positions.get_mut(symbol), exchange_info) {
+                    (None, None) => {
                         log::debug!("[{}] No position (match OK)", symbol);
                     }
-                    (Some(local), true) => {
-                        if (local.data.position_size - exchange_size).abs() > 0.001 {
+                    (Some(local), Some(info)) => {
+                        if (local.data.position_size - info.size).abs() > 0.001 {
                             log::warn!(
                                 "[{}] Size mismatch: local={:.4}, exchange={:.4}. Using exchange.",
-                                symbol,
-                                local.data.position_size,
-                                exchange_size
+                                symbol, local.data.position_size, info.size
                             );
-                            local.data.position_size = exchange_size;
+                            local.data.position_size = info.size;
                         }
                     }
-                    (None, true) => {
-                        log::error!(
-                            "[{}] Orphan exchange position: size={:.4}. Manual intervention needed.",
-                            symbol,
-                            exchange_size
+                    (None, Some(info)) => {
+                        // Import orphan position so the bot can manage it
+                        log::warn!(
+                            "[{}] Orphan position imported: {} size={:.4} @ {:.2}",
+                            symbol, info.side, info.size, info.avg_price
+                        );
+                        local_positions.insert(
+                            symbol.to_string(),
+                            orphan_to_open_position(symbol, info),
                         );
                     }
-                    (Some(_), false) => {
-                        log::error!(
-                            "[{}] Local position exists but exchange size=0. Clearing local state.",
+                    (Some(_), None) => {
+                        log::warn!(
+                            "[{}] Local position exists but exchange size=0. Clearing.",
                             symbol
                         );
                         local_positions.remove(symbol);
@@ -500,7 +520,48 @@ async fn reconcile_positions(
             }
         }
     }
-    log::info!("Position reconciliation complete.");
+    log::info!("Position reconciliation complete ({} open).", local_positions.len());
+}
+
+/// Build an OpenPosition from exchange data when no local state exists.
+fn orphan_to_open_position(symbol: &str, info: ExchangePositionInfo) -> OpenPosition {
+    let sl = if info.stop_loss > 0.0 { info.stop_loss } else {
+        // Fallback: SL 5% away from entry in the opposite direction
+        if info.side == "Buy" {
+            info.avg_price * 0.95
+        } else {
+            info.avg_price * 1.05
+        }
+    };
+    let tp = if info.take_profit > 0.0 { info.take_profit } else {
+        if info.side == "Buy" {
+            info.avg_price * 1.10
+        } else {
+            info.avg_price * 0.90
+        }
+    };
+    log::info!(
+        "[{}] Imported {} @ {:.2} | sl={:.2} tp={:.2} qty={:.4}",
+        symbol, info.side, info.avg_price, sl, tp, info.size
+    );
+    OpenPosition {
+        side: info.side,
+        data: PositionData {
+            is_open:                   true,
+            entry_price:               info.avg_price,
+            actual_entry:              Some(info.avg_price),
+            entry_time:                info.created_time,
+            position_size:             info.size,
+            stop_loss:                 sl,
+            take_profit_1:             tp,
+            take_profit_2:             tp,
+            unrealized_pnl:            0.0,
+            risk_amount:               0.0,
+            max_favorable_excursion:   info.avg_price,
+            order_id:                  String::new(),
+            actual_exit:               None,
+        },
+    }
 }
 
 fn build_signal(

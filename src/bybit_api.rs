@@ -3,6 +3,17 @@ use sha2::Sha256;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Data returned by `get_position_info` for a live exchange position.
+#[derive(Debug, Clone)]
+pub struct ExchangePositionInfo {
+    pub side:         String,
+    pub size:         f64,
+    pub avg_price:    f64,
+    pub stop_loss:    f64,
+    pub take_profit:  f64,
+    pub created_time: i64, // Unix seconds
+}
+
 use crate::config::BYBIT_REST_URL;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -374,6 +385,59 @@ impl BybitClient {
             let sym = sym.clone();
             async move { s.get_position_raw(&sym).await }
         }, 5).await
+    }
+
+    /// Parse position data from exchange. Returns None if no open position (size == 0).
+    pub async fn get_position_info(
+        &self,
+        symbol: &str,
+    ) -> Result<Option<ExchangePositionInfo>, BybitError> {
+        let json = self.get_position(symbol).await?;
+        let entry = json["result"]["list"]
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let size: f64 = entry["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        if size == 0.0 {
+            return Ok(None);
+        }
+
+        Ok(Some(ExchangePositionInfo {
+            side:         entry["side"].as_str().unwrap_or("Buy").to_string(),
+            size,
+            avg_price:    entry["avgPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            stop_loss:    entry["stopLoss"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            take_profit:  entry["takeProfit"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            created_time: entry["createdTime"].as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|ms| ms / 1000)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        }))
+    }
+
+    /// Count open positions on exchange across the given symbols (parallel queries).
+    /// Returns the number of symbols with size > 0.
+    pub async fn count_open_exchange_positions(&self, symbols: &[&str]) -> usize {
+        let handles: Vec<_> = symbols
+            .iter()
+            .map(|&sym| {
+                let client = self.clone();
+                let sym = sym.to_string();
+                tokio::spawn(async move {
+                    matches!(client.get_position_info(&sym).await, Ok(Some(_)))
+                })
+            })
+            .collect();
+
+        let mut count = 0usize;
+        for h in handles {
+            if let Ok(true) = h.await {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Fetch the last `limit` closed klines for a symbol (public endpoint, no auth).

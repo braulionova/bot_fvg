@@ -7,10 +7,11 @@ pub const BYBIT_WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 // ─── Strategy ─────────────────────────────────────────────────────────────────
 pub const ACCOUNT_BALANCE: f64 = 10_000.0;
 pub const MAX_DAILY_LOSS_PCT: f64 = 0.05;   // 5 %
-pub const MAX_RISK_PER_TRADE_PCT: f64 = 0.03; // 3 %
+pub const MAX_RISK_PER_TRADE_PCT: f64 = 0.01; // 1 %  (~$100 USDT)
 pub const EQUITY_FLOOR_PCT: f64 = 0.90;      // 90 %
 
 pub const TRADING_PAIRS: &[&str] = &["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT"];
+pub const MAX_OPEN_POSITIONS: usize = 2;
 pub const KLINE_INTERVAL: &str = "240"; // 4-hour candles (Bybit V5: minutes)
 
 // ─── Parámetros optimizados por símbolo (resultado del grid search) ───────────
