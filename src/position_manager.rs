@@ -17,7 +17,21 @@ pub fn calculate_position_size(signal: &TradeSignal, metrics: &RiskMetrics) -> f
     }
 }
 
+const MIN_ORDER_NOTIONAL: f64 = 100.0; // Bybit minimum order value in USDT
+
 pub fn validate_trade(signal: &TradeSignal, metrics: &RiskMetrics) -> Result<(), String> {
+    if signal.position_size <= 0.0 {
+        return Err("Position size is zero (SL distance exceeds risk budget)".to_string());
+    }
+
+    let notional = signal.position_size * signal.entry_price;
+    if notional < MIN_ORDER_NOTIONAL {
+        return Err(format!(
+            "Notional {:.2} USDT below minimum {:.0} USDT (qty={:.4} @ {:.2})",
+            notional, MIN_ORDER_NOTIONAL, signal.position_size, signal.entry_price
+        ));
+    }
+
     if !metrics.trading_enabled {
         return Err("Trading disabled due to daily loss limit".to_string());
     }
