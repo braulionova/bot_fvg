@@ -115,6 +115,23 @@ impl TelegramBot {
         self.send(&msg).await;
     }
 
+    pub async fn notify_manual_close(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry: f64,
+        pnl: f64,
+    ) {
+        let emoji = if pnl >= 0.0 { "✅" } else { "❌" };
+        let msg = format!(
+            "🖐 <b>Cierre manual detectado — {side} {symbol}</b>\n\
+             Entry: <code>{entry:.2}</code>\n\
+             PnL estimado: {emoji} <code>{pnl:+.2} USDT</code>\n\
+             <i>La posición fue cerrada fuera del bot.</i>",
+        );
+        self.send(&msg).await;
+    }
+
     pub async fn notify_status(
         &self,
         lines: &[String],

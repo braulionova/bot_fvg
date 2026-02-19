@@ -65,6 +65,13 @@ pub struct PositionData {
     pub actual_exit: Option<f64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum BiasDirection {
+    Bullish,
+    Bearish,
+    Neutral,
+}
+
 #[derive(Clone, Debug)]
 pub struct RiskMetrics {
     pub account_balance: f64,

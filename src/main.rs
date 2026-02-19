@@ -4,6 +4,17 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(feature = "jemalloc")]
+fn jemalloc_purge() {
+    use tikv_jemalloc_ctl::epoch;
+    // Advancing the epoch causes jemalloc to evaluate all decay windows
+    // and release dirty pages back to the OS via its background purge logic.
+    if let Ok(e) = epoch::mib() {
+        let _ = e.advance();
+    }
+    log::debug!("jemalloc: epoch advanced — dirty pages scheduled for release");
+}
+
 mod bybit_api;
 mod config;
 mod fvg_detector;
@@ -16,13 +27,16 @@ mod websocket_private;
 
 use chrono::Timelike;
 use config::{
-    symbol_params, ACCOUNT_BALANCE, EQUITY_FLOOR_PCT, KLINE_INTERVAL, MAX_DAILY_LOSS_PCT,
-    MAX_OPEN_POSITIONS, MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS,
+    symbol_params, ACCOUNT_BALANCE, EQUITY_FLOOR_PCT, KLINE_INTERVALS, MAX_DAILY_LOSS_PCT,
+    MAX_OPEN_POSITIONS, MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS, TF_BIAS, TF_ENTRY, TF_STRUCT,
+    USE_ALL_PAIRS,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use bybit_api::ExchangePositionInfo;
-use types::{PositionData, RiskMetrics, SignalType, TradeSignal};
+use types::{BiasDirection, PositionData, RiskMetrics, SignalType, TradeSignal};
 
 struct OpenPosition {
     data: PositionData,
@@ -35,6 +49,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tg = telegram::TelegramBot::new();
     let bybit = bybit_api::BybitClient::new();
+
+    // ── Determine trading pairs ───────────────────────────────────────────────
+    let trading_pairs: Vec<String> = if USE_ALL_PAIRS {
+        match bybit.fetch_linear_symbols().await {
+            Ok(pairs) => {
+                log::info!("Fetched {} USDT linear symbols from Bybit", pairs.len());
+                pairs
+            }
+            Err(e) => {
+                log::warn!("fetch_linear_symbols failed: {} — falling back to default pairs", e);
+                TRADING_PAIRS.iter().map(|s| s.to_string()).collect()
+            }
+        }
+    } else {
+        TRADING_PAIRS.iter().map(|s| s.to_string()).collect()
+    };
+    // Slice of &str for APIs that take &[&str]
+    let pair_refs: Vec<&str> = trading_pairs.iter().map(|s| s.as_str()).collect();
 
     let mut metrics = RiskMetrics {
         account_balance: ACCOUNT_BALANCE,
@@ -52,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positions: HashMap<String, OpenPosition> = HashMap::new();
 
     // ── WebSocket: single connection, all symbols ─────────────────────────────
-    let ws_client = websocket_handler::BybitWsClient::new(TRADING_PAIRS);
+    let ws_client = websocket_handler::BybitWsClient::new(&pair_refs, KLINE_INTERVALS);
     let candle_map = ws_client.candle_map.clone();
     tokio::spawn(async move {
         websocket_handler::reconnect_with_backoff(&ws_client, 20, 5)
@@ -61,40 +93,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ── Reconcile positions with exchange after restart ───────────────────────
-    reconcile_positions(&bybit, &mut positions, TRADING_PAIRS).await;
+    reconcile_positions(&bybit, &mut positions, &pair_refs).await;
 
-    // ── Pre-load historical candles via REST in parallel ──────────────────────
-    log::info!("Pre-loading 30 candles per symbol via REST (parallel)…");
-    let prefetch_handles: Vec<_> = TRADING_PAIRS
+    // ── Pre-load historical candles via REST in parallel ─────────────────────
+    // Semaphore limits concurrent HTTP requests (important with many pairs).
+    let sem = Arc::new(Semaphore::new(20));
+    log::info!(
+        "Pre-loading 30 candles × {} symbols × {} TFs via REST…",
+        trading_pairs.len(), KLINE_INTERVALS.len()
+    );
+    let prefetch_handles: Vec<_> = trading_pairs
         .iter()
-        .map(|&symbol| {
+        .flat_map(|symbol| {
+            let sem = sem.clone();
             let bybit = bybit.clone();
             let candle_map = candle_map.clone();
-            let symbol = symbol.to_string();
-            tokio::spawn(async move {
-                match bybit.fetch_klines(&symbol, KLINE_INTERVAL, 30).await {
-                    Ok(candles) => {
-                        let count = {
-                            let mut map = candle_map.lock().unwrap();
-                            if let Some(buf) = map.get_mut(&symbol) {
-                                for c in candles {
-                                    buf.push_back(c);
-                                }
-                                buf.len()
-                            } else {
-                                0
-                            }
-                        };
-                        log::info!("[{}] pre-loaded {} candles", symbol, count);
+            KLINE_INTERVALS.iter().map(move |&tf| {
+                let sem = sem.clone();
+                let bybit = bybit.clone();
+                let candle_map = candle_map.clone();
+                let symbol = symbol.clone();
+                let tf = tf.to_string();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let key = format!("{}_{}", symbol, tf);
+                    match bybit.fetch_klines(&symbol, &tf, 30).await {
+                        Ok(candles) => {
+                            let count = {
+                                let mut map = candle_map.lock().unwrap();
+                                if let Some(buf) = map.get_mut(&key) {
+                                    for c in candles { buf.push_back(c); }
+                                    buf.len()
+                                } else { 0 }
+                            };
+                            log::info!("[{} {}] pre-loaded {} candles", symbol, tf, count);
+                        }
+                        Err(e) => log::warn!("[{} {}] prefetch failed: {}", symbol, tf, e),
                     }
-                    Err(e) => log::warn!("[{}] kline prefetch failed: {}", symbol, e),
-                }
+                })
             })
         })
         .collect();
-    for h in prefetch_handles {
-        let _ = h.await;
-    }
+    for h in prefetch_handles { let _ = h.await; }
 
     // ── Private WebSocket (production only, not available on demo) ────────────
     #[cfg(feature = "private-ws")]
@@ -128,13 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_pos_state
     };
 
-    let pairs_str = TRADING_PAIRS.join(", ");
+    let pairs_str = if USE_ALL_PAIRS {
+        format!("{} pares USDT linear", trading_pairs.len())
+    } else {
+        trading_pairs.join(", ")
+    };
     tg.send(&format!(
-        "🤖 <b>FVG Trader started</b>\nPairs: {} | TF: 4H | Capital: ${:.0}",
+        "🤖 <b>FVG Trader started</b>\nPairs: {} | TF: 4H bias / 1H BOS / 15M FVG | Capital: ${:.0}",
         pairs_str, ACCOUNT_BALANCE
     ))
     .await;
-    log::info!("FVG Trader started — pairs: {}", pairs_str);
+    log::info!("FVG Trader started — {} pairs", trading_pairs.len());
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     let status_interval = Duration::from_secs(5 * 60);
@@ -155,18 +199,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Collect validated entry signals; orders executed in parallel after loop
         let mut pending_orders: Vec<(String, TradeSignal, String)> = Vec::new();
 
-        for symbol in TRADING_PAIRS {
-            let symbol = symbol.to_string();
-            let candles = match all_candles.get(&symbol) {
+        // ── Detect manually closed positions ─────────────────────────────────
+        // Single REST call fetches all open positions; any locally tracked symbol
+        // absent from the exchange result was closed outside the bot.
+        if !positions.is_empty() {
+            match bybit.get_all_open_positions().await {
+                Ok(exchange_pos) => {
+                    let manually_closed: Vec<String> = positions
+                        .keys()
+                        .filter(|sym| !exchange_pos.contains_key(*sym))
+                        .cloned()
+                        .collect();
+
+                    for sym in manually_closed {
+                        if let Some(op) = positions.get(&sym) {
+                            let entry = op.data.actual_entry.unwrap_or(op.data.entry_price);
+                            let side = op.side.clone();
+                            // unrealized_pnl is the best estimate we have at this point
+                            let pnl_estimate = op.data.unrealized_pnl;
+                            log::warn!(
+                                "[{}] Manual close detected — {} entry={:.2} pnl≈{:+.2}",
+                                sym, side, entry, pnl_estimate
+                            );
+                            tg.notify_manual_close(&sym, &side, entry, pnl_estimate).await;
+                        }
+                        // Derive an approximate exit price from unrealized_pnl so metrics stay consistent
+                        let exit_price = if let Some(op) = positions.get(&sym) {
+                            let entry = op.data.actual_entry.unwrap_or(op.data.entry_price);
+                            let multiplier = if op.side == "Buy" { 1.0_f64 } else { -1.0_f64 };
+                            let qty = op.data.position_size;
+                            if qty > 0.0 {
+                                entry + (op.data.unrealized_pnl / qty) * multiplier
+                            } else {
+                                entry
+                            }
+                        } else {
+                            0.0
+                        };
+                        close_position_local(&mut positions, &sym, &mut metrics, exit_price);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Manual-close check failed: {}", e);
+                }
+            }
+        }
+
+        for symbol in &trading_pairs {
+            let symbol = symbol.clone();
+
+            // Collect candles per TF from the snapshot (keys = "SYMBOL_TF")
+            let key_4h  = format!("{}_{}", symbol, TF_BIAS);
+            let key_1h  = format!("{}_{}", symbol, TF_STRUCT);
+            let key_15m = format!("{}_{}", symbol, TF_ENTRY);
+
+            let candles_4h = match all_candles.get(&key_4h) {
+                Some(c) if c.len() >= 20 => c,
+                _ => continue,
+            };
+            let candles_15m = match all_candles.get(&key_15m) {
                 Some(c) if c.len() >= 20 => c,
                 _ => continue,
             };
 
             let p = symbol_params(&symbol);
-            let atr = calculate_atr(candles, 14);
-            let current_price = candles.last().unwrap().close;
-            let avg_volume =
-                candles.iter().rev().take(20).map(|c| c.volume).sum::<f64>() / 20.0;
+            // ATR stays on 4H — SL/TP params were optimised with 4H ATR
+            let atr = calculate_atr(candles_4h, 14);
+            let current_price = candles_15m.last().unwrap().close;
 
             // ── Manage existing position ──────────────────────────────────────
             if let Some(op) = positions.get_mut(&symbol) {
@@ -198,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 };
 
+                let mut position_closed = false;
                 if let Some(reason) = close_reason {
                     match bybit.close_position(&symbol, &side, pos_qty).await {
                         Ok(_) => {
@@ -212,6 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &mut metrics,
                                 current_price,
                             );
+                            position_closed = true;
                         }
                         Err(e) => {
                             log::error!("[{}] Close order failed: {}", symbol, e);
@@ -224,16 +325,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let h = (now_ts - pos_entry_time) / 3600;
-                let pnl_emoji = if pos_pnl >= 0.0 { "📈" } else { "📉" };
-                let side_emoji = if side == "Buy" { "🟢" } else { "🔴" };
-                status_lines.push(format!(
-                    "{side_emoji} <b>{symbol}</b> — posición abierta\n\
-                     {side} @ <code>{entry:.2}</code> → <code>{current_price:.2}</code>\n\
-                     SL: <code>{pos_sl:.2}</code> | TP: <code>{pos_tp1:.2}</code>\n\
-                     {pnl_emoji} PnL: <code>{pos_pnl:+.2} USDT</code> | {h}h abierta",
-                ));
-                continue; // skip entry logic while position is open for this symbol
+                // Si la posición sigue abierta, mostrar estado y saltar detección de entrada.
+                // Si se cerró en este ciclo, dejar que el flujo continúe para buscar nueva señal.
+                if !position_closed {
+                    let h = (now_ts - pos_entry_time) / 3600;
+                    let pnl_emoji = if pos_pnl >= 0.0 { "📈" } else { "📉" };
+                    let side_emoji = if side == "Buy" { "🟢" } else { "🔴" };
+                    status_lines.push(format!(
+                        "{side_emoji} <b>{symbol}</b> — posición abierta\n\
+                         {side} @ <code>{entry:.2}</code> → <code>{current_price:.2}</code>\n\
+                         SL: <code>{pos_sl:.2}</code> | TP: <code>{pos_tp1:.2}</code>\n\
+                         {pnl_emoji} PnL: <code>{pos_pnl:+.2} USDT</code> | {h}h abierta",
+                    ));
+                    continue;
+                }
+                // position_closed == true → fall through to entry detection below
             }
 
             // ── Look for new entry signals ────────────────────────────────────
@@ -253,37 +359,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            let bullish = fvg_detector::detect_bullish_fvg(candles, &p);
-            let bearish = fvg_detector::detect_bearish_fvg(candles, &p);
-            let last_candle = candles.last().unwrap();
+            // ── Filter 1: 4H bias via SMA(20) ────────────────────────────────
+            let bias = fvg_detector::detect_bias(candles_4h);
+            if bias == BiasDirection::Neutral {
+                log::info!("[{}] 4H bias Neutral — skip", symbol);
+                status_lines.push(format!(
+                    "⚪ <b>{symbol}</b> | <code>{current_price:.2}</code> | 4H bias neutro"
+                ));
+                continue;
+            }
 
-            let fvg_direction = if bullish.is_some() {
-                "bullish"
-            } else if bearish.is_some() {
-                "bearish"
-            } else {
-                "none"
+            // ── Filter 2: 1H Break of Structure ──────────────────────────────
+            let candles_1h = match all_candles.get(&key_1h) {
+                Some(c) if c.len() >= 21 => c,
+                _ => {
+                    let bias_label = if bias == BiasDirection::Bullish { "alcista" } else { "bajista" };
+                    status_lines.push(format!(
+                        "⏳ <b>{symbol}</b> | <code>{current_price:.2}</code> | 1H sin datos suficientes (bias {bias_label})"
+                    ));
+                    continue;
+                }
+            };
+            let structure_ok = fvg_detector::detect_structure_break(candles_1h, &bias);
+            if !structure_ok {
+                let bias_label = if bias == BiasDirection::Bullish { "4H↑" } else { "4H↓" };
+                log::info!("[{}] {} — 1H sin BOS aún", symbol, bias_label);
+                status_lines.push(format!(
+                    "⏳ <b>{symbol}</b> | <code>{current_price:.2}</code> | {bias_label} — 1H sin BOS aún"
+                ));
+                continue;
+            }
+
+            // ── Filter 3: 15M FVG in bias direction ──────────────────────────
+            let avg_volume_15m =
+                candles_15m.iter().rev().take(20).map(|c| c.volume).sum::<f64>() / 20.0;
+            let last_15m = candles_15m.last().unwrap();
+
+            // Bollinger Bands (20, 2σ) sobre 15M — la banda media filtra la entrada
+            let bb_15m = fvg_detector::bollinger_bands(candles_15m, 20);
+
+            let (fvg_opt, signal_type, side_str) = match bias {
+                BiasDirection::Bullish => (
+                    fvg_detector::detect_bullish_fvg(candles_15m, &p),
+                    SignalType::BuyBreakout,
+                    "Buy",
+                ),
+                BiasDirection::Bearish => (
+                    fvg_detector::detect_bearish_fvg(candles_15m, &p),
+                    SignalType::SellBreakout,
+                    "Sell",
+                ),
+                BiasDirection::Neutral => unreachable!(),
             };
 
-            let entry_signal: Option<(TradeSignal, &str)> = if let Some(fvg) = bullish {
-                if fvg_detector::check_fvg_breakout(&fvg, last_candle, avg_volume, &p) {
-                    let mut sig = build_signal(SignalType::BuyBreakout, fvg, current_price);
+            let fvg_direction = if bias == BiasDirection::Bullish { "bullish" } else { "bearish" };
+            let bias_label    = if bias == BiasDirection::Bullish { "4H↑ BOS✓" } else { "4H↓ BOS✓" };
+
+            let entry_signal: Option<(TradeSignal, &str)> = if let Some(fvg) = fvg_opt {
+                if fvg_detector::check_fvg_breakout(&fvg, last_15m, avg_volume_15m, &p) {
+                    let mut sig = build_signal(signal_type, fvg, current_price);
                     position_manager::set_stop_loss(&mut sig, atr, &p);
                     position_manager::calculate_take_profits(&mut sig, &p);
                     sig.position_size =
                         position_manager::calculate_position_size(&sig, &metrics, &p);
-                    Some((sig, "Buy"))
-                } else {
-                    None
-                }
-            } else if let Some(fvg) = bearish {
-                if fvg_detector::check_fvg_breakout(&fvg, last_candle, avg_volume, &p) {
-                    let mut sig = build_signal(SignalType::SellBreakout, fvg, current_price);
-                    position_manager::set_stop_loss(&mut sig, atr, &p);
-                    position_manager::calculate_take_profits(&mut sig, &p);
-                    sig.position_size =
-                        position_manager::calculate_position_size(&sig, &metrics, &p);
-                    Some((sig, "Sell"))
+                    Some((sig, side_str))
                 } else {
                     None
                 }
@@ -293,19 +432,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let has_entry = entry_signal.is_some();
 
-            // Log FVG detection state every cycle for diagnostics
+            // Log state every cycle for diagnostics
+            let bb_log = bb_15m.as_ref().map(|b| format!(
+                "BB[{:.2}/{:.2}/{:.2}]", b.lower, b.middle, b.upper
+            )).unwrap_or_else(|| "BB[n/a]".into());
             match (fvg_direction, has_entry) {
                 (dir, true) => log::info!(
-                    "[{}] {} FVG → breakout confirmado | precio={:.2} ATR={:.2}",
-                    symbol, dir, current_price, atr
+                    "[{}] {} {} FVG 15M → breakout confirmado | precio={:.2} ATR={:.2} {}",
+                    symbol, bias_label, dir, current_price, atr, bb_log
                 ),
-                ("bullish" | "bearish", false) => log::info!(
-                    "[{}] {} FVG detectado, sin breakout aún | precio={:.2} ATR={:.2}",
-                    symbol, fvg_direction, current_price, atr
-                ),
-                _ => log::info!(
-                    "[{}] Sin FVG en ventana ({}v) | precio={:.2} ATR={:.2}",
-                    symbol, p.fvg_lookback, current_price, atr
+                (dir, false) => log::info!(
+                    "[{}] {} {} FVG 15M detectado/pendiente | precio={:.2} ATR={:.2} {}",
+                    symbol, bias_label, dir, current_price, atr, bb_log
                 ),
             }
 
@@ -320,25 +458,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Bollinger Bands compact string for status display
+            let bb_status = bb_15m.as_ref().map(|b| format!(
+                "BB20 ▲<code>{:.2}</code> ─<code>{:.2}</code> ▼<code>{:.2}</code>",
+                b.upper, b.middle, b.lower
+            )).unwrap_or_else(|| "BB20 n/a".into());
+
             // Status line
-            let status_line = match (fvg_direction, has_entry) {
-                ("bullish", true) => format!(
-                    "🟢 <b>{symbol}</b> | <code>{current_price:.2}</code> | Bullish FVG → <b>señal activada</b>"
+            let status_line = match has_entry {
+                true if bias == BiasDirection::Bullish => format!(
+                    "🟢 <b>{symbol}</b> | <code>{current_price:.2}</code> | {bias_label} — Bullish FVG 15M → <b>señal activada</b>\n    {bb_status}"
                 ),
-                ("bearish", true) => format!(
-                    "🔴 <b>{symbol}</b> | <code>{current_price:.2}</code> | Bearish FVG → <b>señal activada</b>"
+                true => format!(
+                    "🔴 <b>{symbol}</b> | <code>{current_price:.2}</code> | {bias_label} — Bearish FVG 15M → <b>señal activada</b>\n    {bb_status}"
                 ),
-                _ => {
-                    if let Some(pend) = fvg_detector::scan_pending_fvg(candles, &p) {
+                false => {
+                    if let Some(pend) = fvg_detector::scan_pending_fvg(candles_15m, &p) {
                         let dir_emoji = if pend.direction == "bullish" { "🔼" } else { "🔽" };
                         let dir_label = if pend.direction == "bullish" { "Bullish" } else { "Bearish" };
                         format!(
-                            "{dir_emoji} <b>{symbol}</b> | <code>{current_price:.2}</code> | {dir_label} FVG [<code>{:.2}</code>–<code>{:.2}</code>]\n    ⏳ Falta: {}",
+                            "{dir_emoji} <b>{symbol}</b> | <code>{current_price:.2}</code> | {bias_label} — {dir_label} FVG 15M [<code>{:.2}</code>–<code>{:.2}</code>]\n    ⏳ Falta: {}\n    {bb_status}",
                             pend.zone_low, pend.zone_high, pend.missing
                         )
                     } else {
                         format!(
-                            "⚪ <b>{symbol}</b> | <code>{current_price:.2}</code> | Sin FVG en ventana ({}v)",
+                            "⚪ <b>{symbol}</b> | <code>{current_price:.2}</code> | {bias_label} — Sin FVG 15M en ventana ({}v)\n    {bb_status}",
                             p.fvg_lookback
                         )
                     }
@@ -352,7 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Verify live exchange position count before placing any order.
             // This guards against state drift (e.g. manual trades, restart races).
             let exchange_open = bybit
-                .count_open_exchange_positions(TRADING_PAIRS)
+                .count_open_exchange_positions(&pair_refs)
                 .await;
             if exchange_open >= MAX_OPEN_POSITIONS {
                 log::warn!(
@@ -443,6 +587,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await;
             last_status_ts = Instant::now();
+
+            // Release unused memory pages back to the OS
+            #[cfg(feature = "jemalloc")]
+            jemalloc_purge();
         }
 
         // ── Daily reset at UTC midnight ───────────────────────────────────────
@@ -484,58 +632,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Reconcile local position state with exchange after restart.
-/// - Orphan (exchange open, no local state) → imports into local state so the bot
-///   can manage SL/TP/time-stop and respect the position cap.
+/// Uses a single REST call to fetch all open positions (no per-symbol loop).
+/// - Orphan (exchange open, no local state) → imports into local state.
 /// - Stale (local state, exchange size=0) → clears local state.
 /// - Size mismatch → updates local qty to match exchange.
 async fn reconcile_positions(
     bybit: &bybit_api::BybitClient,
     local_positions: &mut HashMap<String, OpenPosition>,
-    symbols: &[&str],
+    _symbols: &[&str],
 ) {
-    log::info!("Reconciling positions with exchange…");
-    for &symbol in symbols {
-        match bybit.get_position_info(symbol).await {
-            Err(e) => {
-                log::warn!("[{}] Reconcile fetch failed: {}", symbol, e);
-                continue;
-            }
-            Ok(exchange_info) => {
-                match (local_positions.get_mut(symbol), exchange_info) {
-                    (None, None) => {
-                        log::debug!("[{}] No position (match OK)", symbol);
-                    }
-                    (Some(local), Some(info)) => {
-                        if (local.data.position_size - info.size).abs() > 0.001 {
-                            log::warn!(
-                                "[{}] Size mismatch: local={:.4}, exchange={:.4}. Using exchange.",
-                                symbol, local.data.position_size, info.size
-                            );
-                            local.data.position_size = info.size;
-                        }
-                    }
-                    (None, Some(info)) => {
-                        // Import orphan position so the bot can manage it
-                        log::warn!(
-                            "[{}] Orphan position imported: {} size={:.4} @ {:.2}",
-                            symbol, info.side, info.size, info.avg_price
-                        );
-                        local_positions.insert(
-                            symbol.to_string(),
-                            orphan_to_open_position(symbol, info),
-                        );
-                    }
-                    (Some(_), None) => {
-                        log::warn!(
-                            "[{}] Local position exists but exchange size=0. Clearing.",
-                            symbol
-                        );
-                        local_positions.remove(symbol);
-                    }
+    log::info!("Reconciling positions with exchange (single call)…");
+    let exchange_positions = match bybit.get_all_open_positions().await {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!("Reconcile failed to fetch positions: {} — skipping.", e);
+            return;
+        }
+    };
+
+    // Stale locals: in local state but size=0 on exchange
+    let stale: Vec<String> = local_positions
+        .keys()
+        .filter(|sym| !exchange_positions.contains_key(*sym))
+        .cloned()
+        .collect();
+    for sym in stale {
+        log::warn!("[{}] Local position exists but exchange size=0. Clearing.", sym);
+        local_positions.remove(&sym);
+    }
+
+    // Size mismatch or orphan: positions on exchange
+    for (symbol, info) in exchange_positions {
+        match local_positions.get_mut(&symbol) {
+            Some(local) => {
+                if (local.data.position_size - info.size).abs() > 0.001 {
+                    log::warn!(
+                        "[{}] Size mismatch: local={:.4}, exchange={:.4}. Using exchange.",
+                        symbol, local.data.position_size, info.size
+                    );
+                    local.data.position_size = info.size;
                 }
+            }
+            None => {
+                log::warn!(
+                    "[{}] Orphan position imported: {} size={:.4} @ {:.2}",
+                    symbol, info.side, info.size, info.avg_price
+                );
+                local_positions.insert(
+                    symbol.clone(),
+                    orphan_to_open_position(&symbol, info),
+                );
             }
         }
     }
+
     log::info!("Position reconciliation complete ({} open).", local_positions.len());
 }
 

@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::config::KLINE_INTERVAL;
 use crate::types::Candle;
 
 const PING_INTERVAL_SECS: u64 = 20;
@@ -13,23 +12,28 @@ const PING_INTERVAL_SECS: u64 = 20;
 const WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
 const BUFFER_SIZE: usize = 50;
 
-/// Shared candle buffers keyed by symbol (e.g. "BTCUSDT").
+/// Shared candle buffers keyed by `"SYMBOL_INTERVAL"` (e.g. `"BTCUSDT_240"`).
 pub type CandleMap = Arc<Mutex<HashMap<String, VecDeque<Candle>>>>;
 
 pub struct BybitWsClient {
     symbols: Vec<String>,
+    intervals: Vec<String>,
     pub candle_map: CandleMap,
 }
 
 impl BybitWsClient {
-    /// Pass all symbols to subscribe to (e.g. &["BTCUSDT", "ETHUSDT", …]).
-    pub fn new(symbols: &[&str]) -> Self {
+    /// Pass all symbols and all timeframe intervals to subscribe to.
+    /// Buffer keys are `"SYMBOL_INTERVAL"` (e.g. `"BTCUSDT_240"`).
+    pub fn new(symbols: &[&str], intervals: &[&str]) -> Self {
         let mut map = HashMap::new();
         for &s in symbols {
-            map.insert(s.to_string(), VecDeque::with_capacity(BUFFER_SIZE));
+            for &tf in intervals {
+                map.insert(format!("{}_{}", s, tf), VecDeque::with_capacity(BUFFER_SIZE));
+            }
         }
         BybitWsClient {
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            intervals: intervals.iter().map(|i| i.to_string()).collect(),
             candle_map: Arc::new(Mutex::new(map)),
         }
     }
@@ -40,18 +44,20 @@ impl BybitWsClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe to all symbols in one message
+        // Subscribe to all symbol × interval combinations.
+        // Bybit limits 10 args per subscribe message — send in chunks.
         let args: Vec<String> = self
             .symbols
             .iter()
-            .map(|s| format!("kline.{}.{}", KLINE_INTERVAL, s))
+            .flat_map(|s| self.intervals.iter().map(move |tf| format!("kline.{}.{}", tf, s)))
             .collect();
 
-        let sub_msg = json!({ "op": "subscribe", "args": args });
-        write
-            .send(Message::Text(sub_msg.to_string()))
-            .await?;
-        log::info!("Subscribed to: {:?}", args);
+        log::info!("Subscribing to {} topics across {} symbols…", args.len(), self.symbols.len());
+        for chunk in args.chunks(10) {
+            let sub_msg = json!({ "op": "subscribe", "args": chunk });
+            write.send(Message::Text(sub_msg.to_string())).await?;
+        }
+        log::info!("Subscriptions sent ({} topics)", args.len());
 
         let candle_map = Arc::clone(&self.candle_map);
         let mut ping_timer = interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -79,18 +85,18 @@ impl BybitWsClient {
                                     log::debug!("WebSocket pong received");
                                     continue;
                                 }
-                                // Bybit topic format: "kline.4.BTCUSDT"
+                                // Bybit topic format: "kline.240.BTCUSDT"
+                                // Buffer key = "BTCUSDT_240"
                                 if let Some(topic) = data["topic"].as_str() {
-                                    let symbol = topic
-                                        .splitn(3, '.')
-                                        .nth(2)
-                                        .unwrap_or("")
-                                        .to_string();
+                                    let parts: Vec<&str> = topic.splitn(3, '.').collect();
+                                    if parts.len() == 3 {
+                                        let interval = parts[1]; // e.g. "240"
+                                        let symbol   = parts[2]; // e.g. "BTCUSDT"
+                                        let key = format!("{}_{}", symbol, interval);
 
-                                    if !symbol.is_empty() {
                                         if let Some(kline_arr) = data["data"].as_array() {
                                             let mut map = candle_map.lock().unwrap();
-                                            if let Some(buf) = map.get_mut(&symbol) {
+                                            if let Some(buf) = map.get_mut(&key) {
                                                 for k in kline_arr {
                                                     if let Ok(candle) = Self::parse_candle(k) {
                                                         if candle.timestamp == 0 { continue; }
@@ -102,7 +108,7 @@ impl BybitWsClient {
                                                             if buf.len() > BUFFER_SIZE {
                                                                 buf.pop_front();
                                                             }
-                                                            log::debug!("[{}] candles in buffer: {}", symbol, buf.len());
+                                                            log::debug!("[{} {}] candles in buffer: {}", symbol, interval, buf.len());
                                                         }
                                                     }
                                                 }
@@ -151,12 +157,14 @@ impl BybitWsClient {
         })
     }
 
-    /// Snapshot of candles for a specific symbol.
-    pub fn get_candles(&self, symbol: &str) -> Vec<Candle> {
+    /// Snapshot of candles for a specific symbol + interval.
+    /// Key format: `"SYMBOL_INTERVAL"` (e.g. `"BTCUSDT_240"`).
+    pub fn get_candles(&self, symbol: &str, interval: &str) -> Vec<Candle> {
+        let key = format!("{}_{}", symbol, interval);
         self.candle_map
             .lock()
             .unwrap()
-            .get(symbol)
+            .get(&key)
             .map(|buf| buf.iter().cloned().collect())
             .unwrap_or_default()
     }

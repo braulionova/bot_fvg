@@ -32,6 +32,10 @@ strip          = "debuginfo" # quita debug info, mantiene símbolos
 version  = "0.6"
 optional = true
 
+[dependencies.tikv-jemalloc-ctl]
+version  = "0.6"
+optional = true
+
 [features]
-jemalloc = ["tikv-jemallocator"]
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 private-ws = []  # Enable Bybit private WS (order/execution/position streams) — live only, not demo

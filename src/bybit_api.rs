@@ -417,27 +417,78 @@ impl BybitClient {
         }))
     }
 
-    /// Count open positions on exchange across the given symbols (parallel queries).
-    /// Returns the number of symbols with size > 0.
-    pub async fn count_open_exchange_positions(&self, symbols: &[&str]) -> usize {
-        let handles: Vec<_> = symbols
-            .iter()
-            .map(|&sym| {
-                let client = self.clone();
-                let sym = sym.to_string();
-                tokio::spawn(async move {
-                    matches!(client.get_position_info(&sym).await, Ok(Some(_)))
-                })
-            })
-            .collect();
+    /// Fetch ALL open linear positions in a single authenticated REST call.
+    /// Returns a map of symbol → ExchangePositionInfo (only symbols with size > 0).
+    pub async fn get_all_open_positions(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ExchangePositionInfo>, BybitError> {
+        let ts = Self::timestamp_ms().to_string();
+        let recv_window = "5000";
+        let query = "category=linear&settleCoin=USDT&limit=200";
+        let payload = format!("{}{}{}{}", ts, self.api_key, recv_window, query);
+        let signature = self.sign(&payload);
 
-        let mut count = 0usize;
-        for h in handles {
-            if let Ok(true) = h.await {
-                count += 1;
+        let url = format!("{}/v5/position/list?{}", self.base_url, query);
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-BAPI-API-KEY", &self.api_key)
+            .header("X-BAPI-TIMESTAMP", &ts)
+            .header("X-BAPI-SIGN", signature)
+            .header("X-BAPI-RECV-WINDOW", recv_window)
+            .send()
+            .await
+            .map_err(|e| BybitError::Transient(format!("HTTP error: {}", e)))?;
+
+        let http_status = resp.status().as_u16();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BybitError::Transient(format!("Parse error: {}", e)))?;
+
+        let ret_code = json["retCode"].as_i64().unwrap_or(-1);
+        if ret_code != 0 {
+            let msg = json["retMsg"].as_str().unwrap_or("unknown");
+            return Err(classify_error(ret_code, http_status, msg));
+        }
+
+        let list = match json["result"]["list"].as_array() {
+            Some(l) => l,
+            None => return Ok(std::collections::HashMap::new()),
+        };
+
+        let mut map = std::collections::HashMap::new();
+        for entry in list {
+            let size: f64 = entry["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            if size == 0.0 { continue; }
+            let symbol = match entry["symbol"].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            map.insert(symbol, ExchangePositionInfo {
+                side:         entry["side"].as_str().unwrap_or("Buy").to_string(),
+                size,
+                avg_price:    entry["avgPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                stop_loss:    entry["stopLoss"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                take_profit:  entry["takeProfit"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                created_time: entry["createdTime"].as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|ms| ms / 1000)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            });
+        }
+        Ok(map)
+    }
+
+    /// Count open positions on exchange (single REST call).
+    pub async fn count_open_exchange_positions(&self, _symbols: &[&str]) -> usize {
+        match self.get_all_open_positions().await {
+            Ok(map) => map.len(),
+            Err(e) => {
+                log::warn!("count_open_exchange_positions failed: {}", e);
+                0
             }
         }
-        count
     }
 
     /// Fetch the last `limit` closed klines for a symbol (public endpoint, no auth).
@@ -457,6 +508,46 @@ impl BybitClient {
             let iv = iv.clone();
             async move { s.fetch_klines_raw(&sym, &iv, limit).await }
         }, 3).await
+    }
+
+    /// Fetch all active USDT linear perpetual symbols from Bybit (public, no auth).
+    /// Returns symbols sorted alphabetically.
+    pub async fn fetch_linear_symbols(&self) -> Result<Vec<String>, BybitError> {
+        let url = "https://api.bybit.com/v5/market/instruments-info\
+                   ?category=linear&status=Trading&limit=1000";
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| BybitError::Transient(format!("HTTP error: {}", e)))?;
+
+        let http_status = resp.status().as_u16();
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BybitError::Transient(format!("Parse error: {}", e)))?;
+
+        let ret_code = json["retCode"].as_i64().unwrap_or(-1);
+        if ret_code != 0 {
+            let msg = json["retMsg"].as_str().unwrap_or("unknown");
+            return Err(classify_error(ret_code, http_status, msg));
+        }
+
+        let list = json["result"]["list"]
+            .as_array()
+            .ok_or_else(|| BybitError::Permanent("instruments-info: missing list".into()))?;
+
+        let mut symbols: Vec<String> = list
+            .iter()
+            .filter_map(|item| {
+                let symbol = item["symbol"].as_str()?;
+                let quote  = item["quoteCoin"].as_str()?;
+                if quote == "USDT" { Some(symbol.to_string()) } else { None }
+            })
+            .collect();
+        symbols.sort();
+        Ok(symbols)
     }
 
     /// Place a limit order (better fill, maker fees). side = "Buy" | "Sell"

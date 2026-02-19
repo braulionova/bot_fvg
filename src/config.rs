@@ -10,9 +10,20 @@ pub const MAX_DAILY_LOSS_PCT: f64 = 0.05;   // 5 %
 pub const MAX_RISK_PER_TRADE_PCT: f64 = 0.01; // 1 %  (~$100 USDT)
 pub const EQUITY_FLOOR_PCT: f64 = 0.90;      // 90 %
 
+/// Hardcoded pairs used when USE_ALL_PAIRS = false.
 pub const TRADING_PAIRS: &[&str] = &["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT"];
 pub const MAX_OPEN_POSITIONS: usize = 2;
-pub const KLINE_INTERVAL: &str = "240"; // 4-hour candles (Bybit V5: minutes)
+
+/// If true, bot fetches the full list of active USDT linear perpetuals from Bybit at startup
+/// and scans all of them (currently ~300 pairs).
+/// If false, uses only TRADING_PAIRS above.
+pub const USE_ALL_PAIRS: bool = true;
+
+// ─── Multi-timeframe intervals ────────────────────────────────────────────────
+pub const TF_BIAS:   &str = "240"; // 4H — bias direction via SMA(20)
+pub const TF_STRUCT: &str = "60";  // 1H — Break of Structure confirmation
+pub const TF_ENTRY:  &str = "15";  // 15M — FVG entry
+pub const KLINE_INTERVALS: &[&str] = &[TF_BIAS, TF_STRUCT, TF_ENTRY];
 
 // ─── Parámetros optimizados por símbolo (resultado del grid search) ───────────
 // Generados por: cargo run --bin optimize --release
