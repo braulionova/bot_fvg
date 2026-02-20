@@ -44,22 +44,31 @@ pub struct SymbolParams {
     pub tp_mult:       f64,   // ratio riesgo:recompensa
     pub time_stop:     usize, // velas máximas en posición
     pub qty_step:      f64,   // paso mínimo de cantidad (Bybit lotSize)
+    pub tick_size:     f64,   // paso mínimo de precio (Bybit priceFilter)
 }
 
 pub const fn params(
     min_gap_pct: f64, min_vol_mult: f64, fvg_lookback: usize,
-    sl_atr_mult: f64, tp_mult: f64, time_stop: usize, qty_step: f64,
+    sl_atr_mult: f64, tp_mult: f64, time_stop: usize, qty_step: f64, tick_size: f64,
 ) -> SymbolParams {
-    SymbolParams { min_gap_pct, min_vol_mult, fvg_lookback, sl_atr_mult, tp_mult, time_stop, qty_step }
+    SymbolParams { min_gap_pct, min_vol_mult, fvg_lookback, sl_atr_mult, tp_mult, time_stop, qty_step, tick_size }
+}
+
+/// Number of decimal places for a given tick_size (e.g. 0.01 → 2, 0.0001 → 4).
+pub fn tick_decimals(tick_size: f64) -> usize {
+    if tick_size <= 0.0 { return 2; }
+    let d = -tick_size.log10().floor() as isize;
+    d.max(0) as usize
 }
 
 pub fn symbol_params(symbol: &str) -> SymbolParams {
     match symbol {
-        "BTCUSDT" => params(0.001, 1.5, 12, 0.5, 5.0,  7, 0.001),
-        "ETHUSDT" => params(0.001, 1.5,  8, 1.0, 3.0,  7, 0.01),
-        "BNBUSDT" => params(0.003, 1.0, 12, 2.0, 2.5, 35, 0.01),
-        "XRPUSDT" => params(0.008, 1.0,  8, 2.0, 1.5, 14, 1.0),
-        "SOLUSDT" => params(0.008, 1.2, 12, 1.5, 4.0,  7, 0.1),
-        _         => params(0.003, 1.2,  8, 1.0, 2.0,  7, 1.0), // fallback
+        //                  gap%   vol×  LB  SL×  TP×  stop  qty_step  tick_size
+        "BTCUSDT" => params(0.001, 1.5, 12, 0.5, 5.0,  7, 0.001,  0.10),
+        "ETHUSDT" => params(0.001, 1.5,  8, 1.0, 3.0,  7, 0.01,   0.01),
+        "BNBUSDT" => params(0.003, 1.0, 12, 2.0, 2.5, 35, 0.01,   0.001),
+        "XRPUSDT" => params(0.008, 1.0,  8, 2.0, 1.5, 14, 1.0,    0.0001),
+        "SOLUSDT" => params(0.008, 1.2, 12, 1.5, 4.0,  7, 0.1,    0.01),
+        _         => params(0.003, 1.2,  8, 1.0, 2.0,  7, 1.0,    0.000001), // 6 dp fallback for small-cap
     }
 }

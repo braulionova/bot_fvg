@@ -152,6 +152,7 @@ impl BybitClient {
         qty: f64,
         stop_loss: f64,
         take_profit: f64,
+        price_decimals: usize,
     ) -> Result<String, BybitError> {
         let body = serde_json::json!({
             "category":   "linear",
@@ -159,8 +160,8 @@ impl BybitClient {
             "side":       side,
             "orderType":  "Market",
             "qty":        format!("{:.4}", qty),
-            "stopLoss":   format!("{:.2}", stop_loss),
-            "takeProfit": format!("{:.2}", take_profit),
+            "stopLoss":   format!("{:.*}", price_decimals, stop_loss),
+            "takeProfit": format!("{:.*}", price_decimals, take_profit),
             "tpslMode":   "Full",
             "timeInForce":"GTC"
         })
@@ -346,6 +347,7 @@ impl BybitClient {
         qty: f64,
         stop_loss: f64,
         take_profit: f64,
+        price_decimals: usize,
     ) -> Result<String, BybitError> {
         let s = self.clone();
         let sym = symbol.to_string();
@@ -354,7 +356,7 @@ impl BybitClient {
             let s = s.clone();
             let sym = sym.clone();
             let si = si.clone();
-            async move { s.place_order_raw(&sym, &si, qty, stop_loss, take_profit).await }
+            async move { s.place_order_raw(&sym, &si, qty, stop_loss, take_profit, price_decimals).await }
         }, 3).await
     }
 
@@ -541,9 +543,15 @@ impl BybitClient {
         let mut symbols: Vec<String> = list
             .iter()
             .filter_map(|item| {
-                let symbol = item["symbol"].as_str()?;
-                let quote  = item["quoteCoin"].as_str()?;
-                if quote == "USDT" { Some(symbol.to_string()) } else { None }
+                let symbol   = item["symbol"].as_str()?;
+                let quote    = item["quoteCoin"].as_str()?;
+                let contract = item["contractType"].as_str().unwrap_or("");
+                // Only perpetuals — exclude dated futures (LinearFutures) like XRPUSDT-27MAR26
+                if quote == "USDT" && contract == "LinearPerpetual" {
+                    Some(symbol.to_string())
+                } else {
+                    None
+                }
             })
             .collect();
         symbols.sort();
@@ -559,6 +567,7 @@ impl BybitClient {
         price: f64,
         stop_loss: f64,
         take_profit: f64,
+        price_decimals: usize,
     ) -> Result<String, BybitError> {
         let body = serde_json::json!({
             "category":   "linear",
@@ -566,9 +575,9 @@ impl BybitClient {
             "side":       side,
             "orderType":  "Limit",
             "qty":        format!("{:.4}", qty),
-            "price":      format!("{:.2}", price),
-            "stopLoss":   format!("{:.2}", stop_loss),
-            "takeProfit": format!("{:.2}", take_profit),
+            "price":      format!("{:.*}", price_decimals, price),
+            "stopLoss":   format!("{:.*}", price_decimals, stop_loss),
+            "takeProfit": format!("{:.*}", price_decimals, take_profit),
             "tpslMode":   "Full",
             "timeInForce":"GTC"
         })

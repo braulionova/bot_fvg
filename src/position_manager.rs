@@ -1,4 +1,5 @@
 use crate::config::{SymbolParams, MAX_RISK_PER_TRADE_PCT};
+use crate::fvg_detector::BollingerBands;
 use crate::types::{FVGType, PositionData, RiskMetrics, TradeSignal};
 
 pub fn calculate_position_size(signal: &TradeSignal, metrics: &RiskMetrics, p: &SymbolParams) -> f64 {
@@ -59,37 +60,96 @@ pub fn validate_trade(signal: &TradeSignal, metrics: &RiskMetrics) -> Result<(),
         return Err("Insufficient daily drawdown budget".to_string());
     }
 
+    // Sanity-check TP/SL direction vs trade side to catch miscalculations before
+    // they reach the exchange (e.g. wrong FVG type → inverted TP for a short).
+    match signal.fvg_zone.fvg_type {
+        FVGType::Bullish => {
+            if signal.stop_loss >= signal.entry_price {
+                return Err(format!(
+                    "SL {:.6} must be below entry {:.6} for Buy",
+                    signal.stop_loss, signal.entry_price
+                ));
+            }
+            if signal.take_profit_1 <= signal.entry_price {
+                return Err(format!(
+                    "TP {:.6} must be above entry {:.6} for Buy",
+                    signal.take_profit_1, signal.entry_price
+                ));
+            }
+        }
+        FVGType::Bearish => {
+            if signal.stop_loss <= signal.entry_price {
+                return Err(format!(
+                    "SL {:.6} must be above entry {:.6} for Sell",
+                    signal.stop_loss, signal.entry_price
+                ));
+            }
+            if signal.take_profit_1 >= signal.entry_price {
+                return Err(format!(
+                    "TP {:.6} must be below entry {:.6} for Sell",
+                    signal.take_profit_1, signal.entry_price
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
-pub fn set_stop_loss(signal: &mut TradeSignal, atr: f64, p: &SymbolParams) {
+pub fn set_stop_loss(signal: &mut TradeSignal, atr: f64, p: &SymbolParams, bb: Option<&BollingerBands>) {
     match signal.fvg_zone.fvg_type {
         FVGType::Bullish => {
-            signal.stop_loss = signal.fvg_zone.zone_low - atr * p.sl_atr_mult;
+            signal.stop_loss = if let Some(b) = bb {
+                // BB lower band as dynamic support — invalidation level
+                b.lower
+            } else {
+                signal.fvg_zone.zone_low - atr * p.sl_atr_mult
+            };
             signal.risk_amount =
                 (signal.entry_price - signal.stop_loss) * signal.position_size;
         }
         FVGType::Bearish => {
-            signal.stop_loss = signal.fvg_zone.zone_high + atr * p.sl_atr_mult;
+            signal.stop_loss = if let Some(b) = bb {
+                // BB upper band as dynamic resistance — invalidation level
+                b.upper
+            } else {
+                signal.fvg_zone.zone_high + atr * p.sl_atr_mult
+            };
             signal.risk_amount =
                 (signal.stop_loss - signal.entry_price) * signal.position_size;
         }
     }
 }
 
-pub fn calculate_take_profits(signal: &mut TradeSignal, p: &SymbolParams) {
-    let risk = (signal.entry_price - signal.stop_loss).abs();
+pub fn calculate_take_profits(signal: &mut TradeSignal, p: &SymbolParams, bb: Option<&BollingerBands>) {
     match signal.fvg_zone.fvg_type {
         FVGType::Bullish => {
-            signal.take_profit_1 = signal.entry_price + risk * p.tp_mult;
-            signal.take_profit_2 = signal.entry_price + risk * p.tp_mult * 1.5;
+            if let Some(b) = bb {
+                signal.take_profit_1 = b.middle; // mean-reversion target
+                signal.take_profit_2 = b.upper;  // stretch target (logged only)
+            } else {
+                let risk = (signal.entry_price - signal.stop_loss).abs();
+                signal.take_profit_1 = signal.entry_price + risk * p.tp_mult;
+                signal.take_profit_2 = signal.entry_price + risk * p.tp_mult * 1.5;
+            }
         }
         FVGType::Bearish => {
-            signal.take_profit_1 = signal.entry_price - risk * p.tp_mult;
-            signal.take_profit_2 = signal.entry_price - risk * p.tp_mult * 1.5;
+            if let Some(b) = bb {
+                signal.take_profit_1 = b.middle; // mean-reversion target
+                signal.take_profit_2 = b.lower;  // stretch target (logged only)
+            } else {
+                let risk = (signal.entry_price - signal.stop_loss).abs();
+                signal.take_profit_1 = signal.entry_price - risk * p.tp_mult;
+                signal.take_profit_2 = signal.entry_price - risk * p.tp_mult * 1.5;
+            }
         }
     }
-    signal.risk_reward_ratio = p.tp_mult;
+    let risk = (signal.entry_price - signal.stop_loss).abs();
+    signal.risk_reward_ratio = if risk > 0.0 {
+        (signal.take_profit_1 - signal.entry_price).abs() / risk
+    } else {
+        0.0
+    };
 }
 
 pub fn update_position_pnl(position: &mut PositionData, current_price: f64) {

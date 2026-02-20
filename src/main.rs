@@ -27,9 +27,9 @@ mod websocket_private;
 
 use chrono::Timelike;
 use config::{
-    symbol_params, ACCOUNT_BALANCE, EQUITY_FLOOR_PCT, KLINE_INTERVALS, MAX_DAILY_LOSS_PCT,
-    MAX_OPEN_POSITIONS, MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS, TF_BIAS, TF_ENTRY, TF_STRUCT,
-    USE_ALL_PAIRS,
+    symbol_params, tick_decimals, ACCOUNT_BALANCE, EQUITY_FLOOR_PCT, KLINE_INTERVALS,
+    MAX_DAILY_LOSS_PCT, MAX_OPEN_POSITIONS, MAX_RISK_PER_TRADE_PCT, TRADING_PAIRS, TF_BIAS,
+    TF_ENTRY, TF_STRUCT, USE_ALL_PAIRS,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut status_lines: Vec<String> = Vec::new();
         // Collect validated entry signals; orders executed in parallel after loop
-        let mut pending_orders: Vec<(String, TradeSignal, String)> = Vec::new();
+        let mut pending_orders: Vec<(String, TradeSignal, String, usize)> = Vec::new();
 
         // ── Detect manually closed positions ─────────────────────────────────
         // Single REST call fetches all open positions; any locally tracked symbol
@@ -263,8 +263,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let p = symbol_params(&symbol);
-            // ATR stays on 4H — SL/TP params were optimised with 4H ATR
+            // ATR on 4H as fallback; BB(20,2σ) on 4H for primary SL/TP
             let atr = calculate_atr(candles_4h, 14);
+            let bb_4h = fvg_detector::bollinger_bands(candles_4h, 20);
             let current_price = candles_15m.last().unwrap().close;
 
             // ── Manage existing position ──────────────────────────────────────
@@ -418,10 +419,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let entry_signal: Option<(TradeSignal, &str)> = if let Some(fvg) = fvg_opt {
                 if fvg_detector::check_fvg_breakout(&fvg, last_15m, avg_volume_15m, &p) {
                     let mut sig = build_signal(signal_type, fvg, current_price);
-                    position_manager::set_stop_loss(&mut sig, atr, &p);
-                    position_manager::calculate_take_profits(&mut sig, &p);
+                    position_manager::set_stop_loss(&mut sig, atr, &p, bb_4h.as_ref());
+                    position_manager::calculate_take_profits(&mut sig, &p, bb_4h.as_ref());
+
+                    // Round SL/TP to tick_size BEFORE sizing so position qty
+                    // matches the actual SL distance the exchange will use.
+                    let tick = p.tick_size;
+                    if tick > 0.0 {
+                        sig.stop_loss     = (sig.stop_loss / tick).round() * tick;
+                        sig.take_profit_1 = (sig.take_profit_1 / tick).round() * tick;
+                        sig.take_profit_2 = (sig.take_profit_2 / tick).round() * tick;
+                    }
+
                     sig.position_size =
                         position_manager::calculate_position_size(&sig, &metrics, &p);
+
+                    // Recalculate risk_amount with the final position_size
+                    sig.risk_amount =
+                        (sig.entry_price - sig.stop_loss).abs() * sig.position_size;
+
                     Some((sig, side_str))
                 } else {
                     None
@@ -448,12 +464,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some((sig, side)) = entry_signal {
+                // Hard guard: TP/SL must be directionally consistent with trade side.
+                let tp_ok = if side == "Buy" {
+                    sig.take_profit_1 > sig.entry_price && sig.stop_loss < sig.entry_price
+                } else {
+                    sig.take_profit_1 < sig.entry_price && sig.stop_loss > sig.entry_price
+                };
+                if !tp_ok {
+                    log::error!(
+                        "[{}] TP/SL direction mismatch! side={} entry={:.6} sl={:.6} tp={:.6} fvg_type={:?}",
+                        symbol, side, sig.entry_price, sig.stop_loss, sig.take_profit_1, sig.fvg_zone.fvg_type
+                    );
+                    continue;
+                }
                 match position_manager::validate_trade(&sig, &metrics) {
                     Err(e) => {
                         log::warn!("[{}] Trade skipped: {}", symbol, e);
                     }
                     Ok(_) => {
-                        pending_orders.push((symbol.clone(), sig, side.to_string()));
+                        let pd = tick_decimals(p.tick_size);
+                        pending_orders.push((symbol.clone(), sig, side.to_string(), pd));
                     }
                 }
             }
@@ -511,7 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let order_handles: Vec<_> = pending_orders
                 .into_iter()
                 .take(slots_available)
-                .map(|(symbol, sig, side)| {
+                .map(|(symbol, sig, side, price_dec)| {
                     let bybit = bybit.clone();
                     let tg = tg.clone();
                     tokio::spawn(async move {
@@ -522,6 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 sig.position_size,
                                 sig.stop_loss,
                                 sig.take_profit_1,
+                                price_dec,
                             )
                             .await
                         {
